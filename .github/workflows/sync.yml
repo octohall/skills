@@ -27,7 +27,7 @@ env:
   MAX_BYTES: "65536"
   # Off until octohall.com serves its Agent Skills index (OctoHall issue #1367). Turn it on ("true") in a
   # reviewed pull request once that index is live, after checking the field names in the digest step.
-  CHECK_DIGEST: "false"
+  CHECK_DIGEST: "true"
   INDEX_URL: https://octohall.com/.well-known/agent-skills/index.json
   LC_ALL: C.UTF-8
 
