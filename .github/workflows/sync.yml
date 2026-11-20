@@ -1,0 +1,227 @@
+name: Sync the skill
+
+# Copies https://octohall.com/skill/package.md into skills/octohall/SKILL.md, byte for byte, through a pull
+# request that a maintainer merges. Every check fails closed: when a check can't run or doesn't pass, the run
+# fails and nothing is proposed. No secrets: the default token only, with the least each job needs.
+on:
+  schedule:
+    - cron: "23 * * * *" # hourly, at minute 23
+  workflow_dispatch:
+
+# Nothing by default; each job asks for exactly what it needs.
+permissions: {}
+
+# One run at a time. A second run waits instead of racing the first.
+concurrency:
+  group: sync-skill
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE_URL: https://octohall.com/skill/package.md
+  TARGET: skills/octohall/SKILL.md
+  MIN_BYTES: "8192"
+  MAX_BYTES: "65536"
+  # Off until octohall.com serves its Agent Skills index (OctoHall issue #1367). Turn it on ("true") in a
+  # reviewed pull request once that index is live, after checking the field names in the digest step.
+  CHECK_DIGEST: "false"
+  INDEX_URL: https://octohall.com/.well-known/agent-skills/index.json
+  LC_ALL: C.UTF-8
+
+jobs:
+  check:
+    name: Fetch and check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.forward.outputs.changed }}
+      version: ${{ steps.shape.outputs.version }}
+      sha256: ${{ steps.fetch.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the live file
+        id: fetch
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/in"
+          meta=$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --max-redirs 0 --max-time 30 --max-filesize "$MAX_BYTES" \
+            --output "$RUNNER_TEMP/in/SKILL.md" \
+            --write-out '%{http_code} %{content_type}' "$SOURCE_URL") || fail "fetch failed"
+          case "$meta" in
+            "200 text/markdown"*) ;;
+            *) fail "expected a 200 answer with text/markdown" ;;
+          esac
+          sha=$(sha256sum "$RUNNER_TEMP/in/SKILL.md" | cut -d ' ' -f 1)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check the shape
+        id: shape
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          count() { grep -c "$@" || true; }
+          f="$RUNNER_TEMP/in/SKILL.md"
+          fm="$RUNNER_TEMP/front-matter"
+
+          size=$(wc -c < "$f")
+          [ "$size" -ge "$MIN_BYTES" ] && [ "$size" -le "$MAX_BYTES" ] || fail "size out of bounds"
+          iconv -f UTF-8 -t UTF-8 "$f" > /dev/null || fail "not valid UTF-8"
+          if grep -a -q -P '[\x00-\x08\x0B-\x1F\x7F]' "$f"; then fail "control characters"; fi
+          if grep -a -q -P '[\x{00AD}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}]' "$f"; then
+            fail "hidden or direction-changing characters"
+          fi
+
+          [ "$(head -n 1 "$f")" = "---" ] || fail "no front matter"
+          end=$(awk 'NR > 1 && $0 == "---" { print NR; exit }' "$f")
+          [ -n "$end" ] && [ "$end" -le 30 ] || fail "front matter not closed within 30 lines"
+          sed -n "2,$((end - 1))p" "$f" > "$fm"
+          bad=$(count -v -E '^(name|description|license|compatibility|metadata):|^  (version|homepage|api_base|openapi|changelog): "[^"]*"$' "$fm")
+          [ "$bad" = 0 ] || fail "unexpected front-matter key or shape"
+          dups=$(cut -d ':' -f 1 "$fm" | sort | uniq -d)
+          [ -z "$dups" ] || fail "a front-matter key appears twice"
+          [ "$(count -x 'name: octohall' "$fm")" = 1 ] || fail "name is not octohall"
+          [ "$(count -E '^description: "[^"]{20,1024}"$' "$fm")" = 1 ] || fail "description missing or too long"
+          [ "$(count -x 'metadata:' "$fm")" = 1 ] || fail "no metadata block"
+          version=$(sed -n -E 's/^  version: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$fm")
+          [ -n "$version" ] || fail "metadata.version is not N.N.N"
+
+          [ "$(count -F '"join_source": "skill_package"' "$f")" = 1 ] || fail "not the packaged copy"
+          [ "$(count -F '"join_source": "skill_md"' "$f")" = 0 ] || fail "not the packaged copy"
+
+          if grep -q -i -E 'https?://[^/[:space:]]*@' "$f"; then fail "a link with a user name in it"; fi
+          hosts=$(grep -o -i -E 'https?://[a-z0-9.-]*[a-z0-9]' "$f" | tr 'A-Z' 'a-z' | sort -u || true)
+          for h in $hosts; do
+            case "$h" in
+              https://octohall.com|https://api.octohall.com) ;;
+              *) fail "a link to a host other than octohall.com and api.octohall.com" ;;
+            esac
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install gitleaks 8.30.1 (pinned, checksum checked)
+        run: |
+          set -u
+          tarball=gitleaks_8.30.1_linux_x64.tar.gz
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$tarball"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/$tarball" | sha256sum --check --quiet -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" gitleaks
+
+      - name: No secret-shaped text (gitleaks, redacted)
+        env:
+          # gitleaks' default rules plus OctoHall's key format (the same rule as the octohall repo's .gitleaks.toml).
+          GITLEAKS_CONFIG_TOML: |
+            title = "octohall/skills"
+            [extend]
+            useDefault = true
+            [[rules]]
+            id = "octohall-agent-api-key"
+            description = "OctoHall agent API key (oh_live_ / oh_test_ + 43 base62 chars)"
+            regex = '''\boh_(?:live|test)_[0-9A-Za-z]{43}\b'''
+            keywords = ["oh_live_", "oh_test_"]
+        run: |
+          "$RUNNER_TEMP/bin/gitleaks" dir --redact --no-banner --max-decode-depth 2 "$RUNNER_TEMP/in/SKILL.md"
+
+      # OFF until OctoHall issue #1367 ships /.well-known/agent-skills/index.json. Before turning it on, check that
+      # the index has a `skills` list whose `octohall` entry carries `"digest": "sha256:<hex>"`; adjust the jq line if not.
+      - name: Digest matches octohall.com's own index (off until #1367)
+        if: env.CHECK_DIGEST == 'true'
+        env:
+          SHA256: ${{ steps.fetch.outputs.sha256 }}
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --max-redirs 0 --max-time 30 --max-filesize 65536 \
+            --output "$RUNNER_TEMP/index.json" "$INDEX_URL" || fail "index fetch failed"
+          want=$(jq -r '[.skills[]? | select(.name == "octohall") | .digest] | if length == 1 then .[0] else "" end' \
+            "$RUNNER_TEMP/index.json") || fail "the index is not the expected JSON"
+          [ "$want" = "sha256:$SHA256" ] || fail "the file's sha256 doesn't match octohall.com's index"
+
+      - name: Only forward
+        id: forward
+        env:
+          VERSION: ${{ steps.shape.outputs.version }}
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          f="$RUNNER_TEMP/in/SKILL.md"
+          if [ -f "$TARGET" ]; then
+            if cmp -s "$TARGET" "$f"; then
+              echo "Already up to date."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            old=$(sed -n -E '2,30s/^  version: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$TARGET")
+            case "$old" in
+              "" | *[!0-9.]*) fail "can't read the current copy's version" ;;
+            esac
+            [ "$old" != "$VERSION" ] || fail "the live file changed but its version did not"
+            top=$(printf '%s\n%s\n' "$old" "$VERSION" | sort -V | tail -n 1)
+            [ "$top" = "$VERSION" ] || fail "the live version is older than this copy"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  propose:
+    name: Open the pull request
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      SHA256: ${{ needs.check.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fetch again and require the checked bytes
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bad version from the check job"
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "bad sha256 from the check job"
+          mkdir -p "$RUNNER_TEMP/in"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            --max-redirs 0 --max-time 30 --max-filesize "$MAX_BYTES" \
+            --output "$RUNNER_TEMP/in/SKILL.md" "$SOURCE_URL" || fail "fetch failed"
+          got=$(sha256sum "$RUNNER_TEMP/in/SKILL.md" | cut -d ' ' -f 1)
+          [ "$got" = "$SHA256" ] || fail "the live file changed after the check; the next run picks it up"
+
+      - name: Commit the one file and open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          fail() { echo "::error::$1"; exit 1; }
+          branch="sync/skill-v$VERSION"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" > /dev/null; then
+            echo "::warning::Branch $branch already exists: its pull request is open, or it was closed without merging. Nothing to do."
+            exit 0
+          fi
+          git switch --quiet -c "$branch"
+          mkdir -p "$(dirname "$TARGET")"
+          cp "$RUNNER_TEMP/in/SKILL.md" "$TARGET"
+          git add -- "$TARGET"
+          status=$(git status --porcelain --untracked-files=all)
+          [ "$status" = "M  $TARGET" ] || [ "$status" = "A  $TARGET" ] || fail "something other than the skill file changed"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "Sync the skill to version $VERSION" -m "A byte-for-byte copy of $SOURCE_URL (sha256 $SHA256)."
+          git push --quiet origin "refs/heads/$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Sync the skill to version $VERSION" \
+            --body "A byte-for-byte copy of $SOURCE_URL, version $VERSION, sha256 \`$SHA256\`. Only \`$TARGET\` changes. The sync workflow checked the file's size, characters, front matter, links and version, and ran gitleaks. To check it yourself: \`curl -sS --fail $SOURCE_URL | sha256sum\` prints the same sha256 while the live file is unchanged."
